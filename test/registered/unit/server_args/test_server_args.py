@@ -500,9 +500,7 @@ class TestMambaRadixCacheArgs(CustomTestCase):
 
         self.assertIn("--enable-mixed-chunk", str(context.exception))
         self.assertIn("reduce model accuracy", str(context.exception))
-        self.assertIn(
-            "--mamba-scheduler-strategy no_buffer", str(context.exception)
-        )
+        self.assertIn("--mamba-scheduler-strategy no_buffer", str(context.exception))
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_mamba_extra_buffer_without_mixed_chunk_is_allowed(self, _mock_is_cuda):
