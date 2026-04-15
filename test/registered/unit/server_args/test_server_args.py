@@ -477,5 +477,42 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestMambaRadixCacheArgs(CustomTestCase):
+    def _make_dummy_mamba_args(self, **overrides) -> ServerArgs:
+        args = ServerArgs(model_path="dummy")
+        args.mamba_scheduler_strategy = "extra_buffer"
+        args.disable_radix_cache = False
+        args.enable_mixed_chunk = False
+        args.speculative_num_draft_tokens = None
+        args.page_size = None
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_mamba_extra_buffer_rejects_mixed_chunk_before_cuda_check(
+        self, _mock_is_cuda
+    ):
+        args = self._make_dummy_mamba_args(enable_mixed_chunk=True)
+
+        with self.assertRaises(ValueError) as context:
+            args._handle_mamba_radix_cache("Mamba2ForCausalLM")
+
+        self.assertIn("--enable-mixed-chunk", str(context.exception))
+        self.assertIn("reduce model accuracy", str(context.exception))
+        self.assertIn(
+            "--mamba-scheduler-strategy no_buffer", str(context.exception)
+        )
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_mamba_extra_buffer_without_mixed_chunk_is_allowed(self, _mock_is_cuda):
+        args = self._make_dummy_mamba_args()
+
+        args._handle_mamba_radix_cache("Mamba2ForCausalLM")
+
+        self.assertTrue(args.enable_mamba_extra_buffer())
+        self.assertFalse(args.enable_mixed_chunk)
+
+
 if __name__ == "__main__":
     unittest.main()

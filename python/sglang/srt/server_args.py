@@ -2253,6 +2253,13 @@ class ServerArgs:
                     "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
                     "Please use --mamba-scheduler-strategy no_buffer instead."
                 )
+            if self.enable_mixed_chunk:
+                raise ValueError(
+                    "mamba extra_buffer is not compatible with --enable-mixed-chunk "
+                    "because this combination may reduce model accuracy. "
+                    "Please disable --enable-mixed-chunk or use "
+                    "--mamba-scheduler-strategy no_buffer instead."
+                )
 
             assert (
                 is_cuda()
