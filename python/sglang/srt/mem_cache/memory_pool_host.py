@@ -1040,11 +1040,16 @@ class MLATokenToKVPoolHost(HostKVCache):
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
                     )
                 else:
+                    _dst_indices = (
+                        host_indices.to(self.device_pool.device)
+                        if not host_indices.is_cuda
+                        else host_indices
+                    )
                     transfer_kv_all_layer_mla_lf_pf(
                         src_layers=device_pool.data_ptrs,
                         dst=self.kv_buffer,
                         src_indices=device_indices,
-                        dst_indices=host_indices,
+                        dst_indices=_dst_indices,
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
@@ -1457,6 +1462,8 @@ class MambaPoolHost(HostKVCache):
                 dtype=torch.uint64,
                 device=device,
             )
+            if not dst_indices.is_cuda:
+                dst_indices = dst_indices.to(device)
             transfer_kv_all_layer_mla_lf_pf(
                 src_layers=src_ptrs,
                 dst=dst,
@@ -2008,11 +2015,16 @@ class NSAIndexerPoolHost(HostKVCache):
                     num_layers=self.layer_num,
                 )
             elif self.layout == "page_first":
+                _dst_page_indices = (
+                    host_page_indices.to(self.device_pool.device)
+                    if not host_page_indices.is_cuda
+                    else host_page_indices
+                )
                 transfer_kv_all_layer_mla_lf_pf(
                     src_layers=self.index_k_device_ptrs,
                     dst=self.index_k_with_scale_buffer,
                     src_indices=device_page_indices,
-                    dst_indices=host_page_indices,
+                    dst_indices=_dst_page_indices,
                     item_size=self.indexer_page_stride_size,
                     dst_layout_dim=self.indexer_layout_dim,
                     num_layers=self.layer_num,
