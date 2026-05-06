@@ -136,6 +136,17 @@ class FutureMap:
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
+            if draft_input.future_indices is None:
+                # The draft input can already contain real tensors when a
+                # prefill-containing mixed chunk batch was run without overlap.
+                # In that case there is no future entry to resolve.
+                assert draft_input.topk_p is not None
+                assert draft_input.topk_index is not None
+                assert draft_input.verified_id is not None
+                assert draft_input.new_seq_lens is not None
+                if spec_need_hidden_states():
+                    assert draft_input.hidden_states is not None
+                return
             indices = draft_input.future_indices.indices
             # The indices tensor was allocated on the default stream but is
             # used here on the forward stream. Meanwhile, the old spec_info

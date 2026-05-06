@@ -1885,15 +1885,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
 
-        # For overlap scheduler, the output_ids has one step delay
-        delta = 0 if self.enable_overlap else -1
-
-        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        # The running requests were just prepared for a normal one-token decode,
+        # so their query length in this mixed prefill batch must be exactly 1.
+        # Deriving the prefix from seq_lens avoids depending on output_ids'
+        # overlap/non-overlap delay state.
         self.prefix_lens.extend(
-            [
-                len(r.origin_input_ids) + len(r.output_ids) + delta
-                for r in running_batch.reqs
-            ]
+            (running_batch.seq_lens_cpu - 1).tolist()
         )
         self.extend_lens.extend([1] * running_bs)
         self.extend_num_tokens += running_bs
@@ -2059,7 +2056,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
-    def prepare_for_decode(self):
+    def prepare_for_decode(self, for_mixed_chunk: bool = False):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         # Decode embeds the last output token via embed_tokens; clear the stale
@@ -2073,11 +2070,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.nsa_cp_metadata = None
 
         if self.is_spec_v2:
-            # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
-            draft_input.prepare_for_decode(self)
+            assert draft_input is not None
+            if for_mixed_chunk:
+                # Spec-v2 overlap keeps seq_lens on GPU as the authoritative
+                # accepted length. Mixed chunk falls back to a normal one-token
+                # decode, so sync CPU metadata before the regular decode update.
+                self.maybe_wait_verify_done()
+                self.seq_lens_cpu = self.seq_lens.cpu()
+                self.seq_lens_sum = self.seq_lens_cpu.sum().item()
+            else:
+                # TODO(spec-v2): all spec v2 should go through this path
+                draft_input.prepare_for_decode(self)
 
-        if not self.spec_algorithm.is_none():
+        if not self.spec_algorithm.is_none() and not for_mixed_chunk:
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
@@ -2173,7 +2179,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
-        if self.is_spec_v2:
+        if self.is_spec_v2 and self.spec_info is not None:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()

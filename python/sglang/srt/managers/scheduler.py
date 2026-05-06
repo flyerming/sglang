@@ -1346,27 +1346,47 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            drained_before_schedule = self.should_drain_before_mixed_chunk_prefill()
+            if drained_before_schedule:
+                pop_and_process()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            run_without_overlap_for_batch = (
+                self.is_mixed_chunk_spec_prefill_batch(batch)
+            )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and self.result_queue:
                 pop_and_process()
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                batch_result = self.run_batch(
+                    batch, disable_overlap=run_without_overlap_for_batch
+                )
+                if run_without_overlap_for_batch:
+                    # This batch intentionally bypassed scheduler overlap, so
+                    # finish any delayed sampling and process it in this turn.
+                    self.launch_batch_sample_if_needed(batch_result)
+                    self.process_batch_result(batch, batch_result)
+                    batch_result = None  # Already processed; skip delayed sample below
+                else:
+                    self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
                 self.cancel_bubble_timer()
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if (
+                    not drained_before_schedule
+                    and not disable_overlap_for_batch
+                    and self.result_queue
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -1382,7 +1402,30 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
-    def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
+    def is_mixed_chunk_spec_prefill_batch(
+        self, batch: Optional[ScheduleBatch]
+    ) -> bool:
+        if (
+            not batch
+            or self.spec_algorithm.is_none()
+            or not self.server_args.enable_mixed_chunk
+        ):
+            return False
+
+        if self.require_mlp_sync:
+            return batch.is_extend_in_batch
+        return batch.forward_mode.is_extend()
+
+    def should_drain_before_mixed_chunk_prefill(self) -> bool:
+        return (
+            not self.spec_algorithm.is_none()
+            and self.server_args.enable_mixed_chunk
+            and self.result_queue
+            and not self.running_batch.is_empty()
+            and (self.chunked_req is not None or len(self.waiting_queue) > 0)
+        )
+
+    def is_disable_overlap_for_batch(self, batch: Optional[ScheduleBatch]) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
         # In DP attention mode, use the globally synchronized is_extend_in_batch
@@ -1402,6 +1445,11 @@ class Scheduler(
             and last_batch_is_extend
         )
 
+        # With mixed chunk + speculative decoding, batches that contain prefill
+        # run as a normal mixed prefill/decode step. Pure decode batches still
+        # use the speculative overlap path.
+        disable_overlap_for_mixed_chunk = self.is_mixed_chunk_spec_prefill_batch(batch)
+
         # We do not support overlap + spec + grammar yet,
         # so we need to turn off overlap for this batch.
         # TODO(lsyin): support overlap + spec + grammar
@@ -1413,7 +1461,11 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
-        return disable_overlap_for_batch or need_grammar_sync
+        return (
+            disable_overlap_for_batch
+            or disable_overlap_for_mixed_chunk
+            or need_grammar_sync
+        )
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -2533,7 +2585,12 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
+                # Mixed chunk runs the active decode requests as a normal
+                # one-token decode step. The batch may still carry spec state so
+                # the draft input can be refreshed for the next pure decode step.
+                self.running_batch.prepare_for_decode(
+                    for_mixed_chunk=not self.spec_algorithm.is_none()
+                )
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = ScheduleBatch(
@@ -2637,9 +2694,11 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        disable_overlap: bool = False,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        use_overlap = self.enable_overlap and not disable_overlap
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -2665,7 +2724,13 @@ class Scheduler(
                 # TODO(lsyin): delete this branch after unifying the abstraction.
                 worker_batch_or_batch = batch
 
-            if self.enable_overlap:
+            if disable_overlap and batch.is_spec_v2 and batch.forward_mode.is_extend():
+                # The target mixed prefill/decode step should not consume the
+                # previous speculative draft input. EAGLE will rebuild the next
+                # draft input from this target forward's hidden states.
+                worker_batch_or_batch.spec_info = None
+
+            if use_overlap:
                 model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
 
@@ -2725,6 +2790,10 @@ class Scheduler(
                         worker_batch_or_batch, **kwargs
                     )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
+                if batch.is_spec_v2 and batch_result.next_draft_input is not None:
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch.spec_info.new_seq_lens is not None:
+                        batch.seq_lens = batch.spec_info.new_seq_lens
                 self.update_cache_from_scheduler(batch, batch_result)
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
@@ -2751,7 +2820,7 @@ class Scheduler(
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
 
-            if self.enable_overlap:
+            if use_overlap:
                 self.record_batch_in_overlap(model_worker_batch)
                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
@@ -3488,6 +3557,10 @@ def dispatch_event_loop(scheduler: Scheduler):
     # Dispatch to the appropriate event loop based on the disaggregation mode
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+
+    # When mixed chunk prefill and speculative decoding are both enabled, the
+    # overlap loop falls back to a non-overlap mixed prefill/decode step only
+    # for batches that contain prefill. Pure decode keeps the spec-v2 overlap path.
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
